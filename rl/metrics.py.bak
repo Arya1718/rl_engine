@@ -1,0 +1,700 @@
+"""
+Healthcare RL Metrics Suite
+─────────────────────────────────
+Comprehensive battery of evaluation metrics for fairness-constrained
+reinforcement learning in healthcare, covering inequality measurement,
+statistical inference, welfare economics, distributional analysis,
+risk quantification, and policy quality diagnostics.
+
+Metrics Catalogue (26+):
+  Gini coefficient (with Lorenz curve) | Theil T / Theil L (GE-1 / GE-0)
+  Atkinson index (parametric ε) | Hoover (Robin Hood) index | Palma ratio
+  Coefficient of Variation | Inter-Quartile Ratio | Bootstrap CI (BCa)
+  Mann–Whitney U | Wilcoxon signed-rank | Kolmogorov–Smirnov 2-sample
+  Welfare: utilitarian, Rawlsian, Nash, Bernoulli-Nash, prioritarian
+  CVaR / VaR / Sharpe / Sortino / Max Drawdown
+  Policy entropy / normalised entropy | KL divergence | JS divergence
+  Wasserstein-1 | Total variation | Autocorrelation | EWMA | Linear slope
+  Convergence rate | Effective sample size | Intersectional fairness matrix
+  Demographic parity ratio | Composite healthcare score
+"""
+
+from __future__ import annotations
+
+import math
+from typing import Dict, Iterable, List, Optional, Tuple
+
+
+# ════════════════════════════════════════════════════════════════════════════════
+#  Basic Statistical Utilities
+# ════════════════════════════════════════════════════════════════════════════════
+
+def mean(values: List[float]) -> float:
+    """Arithmetic mean with empty-list guard."""
+    if not values:
+        return 0.0
+    return sum(values) / len(values)
+
+
+def variance(values: List[float], ddof: int = 1) -> float:
+    """Sample variance with Bessel correction (ddof=1) by default."""
+    n = len(values)
+    if n < 2:
+        return 0.0
+    mu = mean(values)
+    return sum((v - mu) ** 2 for v in values) / max(1, n - ddof)
+
+
+def std(values: List[float], ddof: int = 1) -> float:
+    """Sample standard deviation."""
+    return math.sqrt(max(0.0, variance(values, ddof)))
+
+
+def median_val(values: List[float]) -> float:
+    """Exact median (interpolated for even n)."""
+    if not values:
+        return 0.0
+    s = sorted(values)
+    n = len(s)
+    mid = n // 2
+    if n % 2 == 1:
+        return s[mid]
+    return (s[mid - 1] + s[mid]) / 2.0
+
+
+def percentile(values: List[float], q: float) -> float:
+    """Linear-interpolation percentile (q in [0, 100])."""
+    if not values:
+        return 0.0
+    s = sorted(values)
+    n = len(s)
+    k = (q / 100.0) * (n - 1)
+    lo = int(math.floor(k))
+    hi = min(lo + 1, n - 1)
+    frac = k - lo
+    return s[lo] * (1.0 - frac) + s[hi] * frac
+
+
+def _safe_log(x: float) -> float:
+    return math.log(max(x, 1e-300))
+
+
+# ════════════════════════════════════════════════════════════════════════════════
+#  Inequality Indices
+# ════════════════════════════════════════════════════════════════════════════════
+
+def gini_coefficient(values: Iterable[float]) -> float:
+    """
+    Gini coefficient in [0, 1] via the rank-weighted formula.
+    G = (2 * sum(i * x_sorted[i])) / (n * sum(x)) - (n+1)/n
+    """
+    data = [max(0.0, float(v)) for v in values]
+    n = len(data)
+    if n == 0:
+        return 0.0
+    total = sum(data)
+    if total <= 1e-12:
+        return 0.0
+    ordered = sorted(data)
+    weighted_sum = 0.0
+    for index, value in enumerate(ordered, start=1):
+        weighted_sum += index * value
+    return (2.0 * weighted_sum) / (n * total) - (n + 1.0) / n
+
+
+def lorenz_curve(values: List[float], num_points: int = 50) -> List[Tuple[float, float]]:
+    """
+    Lorenz curve as (cumulative population share, cumulative income share).
+    Returns *num_points* equally-spaced evaluation points plus origin.
+    """
+    if not values:
+        return [(0.0, 0.0), (1.0, 1.0)]
+    ordered = sorted(max(0.0, v) for v in values)
+    n = len(ordered)
+    total = sum(ordered)
+    if total <= 1e-12:
+        return [(0.0, 0.0), (1.0, 1.0)]
+    curve: List[Tuple[float, float]] = [(0.0, 0.0)]
+    cumsum = 0.0
+    step = max(1, n // num_points)
+    for i in range(n):
+        cumsum += ordered[i]
+        if (i + 1) % step == 0 or i == n - 1:
+            curve.append(((i + 1) / n, cumsum / total))
+    return curve
+
+
+def theil_t_index(values: List[float]) -> float:
+    """Theil-T index (Generalised Entropy alpha=1): GE(1) = (1/n) sum (x_i/mu) ln(x_i/mu)."""
+    data = [max(1e-12, float(v)) for v in values]
+    n = len(data)
+    if n == 0:
+        return 0.0
+    mu = sum(data) / n
+    if mu <= 1e-12:
+        return 0.0
+    return sum((x / mu) * _safe_log(x / mu) for x in data) / n
+
+
+def theil_l_index(values: List[float]) -> float:
+    """Theil-L index (mean log deviation, GE alpha=0): GE(0) = (1/n) sum ln(mu/x_i)."""
+    data = [max(1e-12, float(v)) for v in values]
+    n = len(data)
+    if n == 0:
+        return 0.0
+    mu = sum(data) / n
+    if mu <= 1e-12:
+        return 0.0
+    return sum(_safe_log(mu / x) for x in data) / n
+
+
+def atkinson_index(values: List[float], epsilon: float = 0.5) -> float:
+    """
+    Atkinson index with inequality-aversion parameter epsilon.
+    A(eps) = 1 - (1/mu) [sum(x_i^(1-eps)) / n]^(1/(1-eps))  for eps != 1
+    A(1)   = 1 - (1/mu) exp[(1/n) sum ln(x_i)]               for eps = 1
+    """
+    data = [max(1e-12, float(v)) for v in values]
+    n = len(data)
+    if n == 0:
+        return 0.0
+    mu = sum(data) / n
+    if mu <= 1e-12:
+        return 0.0
+    if abs(epsilon - 1.0) < 1e-9:
+        log_mean = sum(_safe_log(x) for x in data) / n
+        return 1.0 - math.exp(log_mean) / mu
+    exponent = 1.0 - epsilon
+    power_mean = (sum(x ** exponent for x in data) / n) ** (1.0 / exponent)
+    return 1.0 - power_mean / mu
+
+
+def hoover_index(values: List[float]) -> float:
+    """Hoover (Robin Hood) index: half the relative mean absolute deviation."""
+    data = [max(0.0, float(v)) for v in values]
+    n = len(data)
+    if n == 0:
+        return 0.0
+    mu = sum(data) / n
+    if mu <= 1e-12:
+        return 0.0
+    return sum(abs(x - mu) for x in data) / (2.0 * n * mu)
+
+
+def palma_ratio(values: List[float]) -> float:
+    """Palma ratio: share of top 10% divided by share of bottom 40%."""
+    if not values:
+        return 0.0
+    ordered = sorted(values)
+    n = len(ordered)
+    bottom_40 = sum(ordered[:max(1, int(0.4 * n))])
+    top_10 = sum(ordered[max(0, int(0.9 * n)):])
+    if bottom_40 <= 1e-12:
+        return float("inf") if top_10 > 1e-12 else 0.0
+    return top_10 / bottom_40
+
+
+def coefficient_of_variation(values: List[float]) -> float:
+    """CV = sigma / mu."""
+    mu = mean(values)
+    if abs(mu) < 1e-12:
+        return 0.0
+    return std(values, ddof=0) / abs(mu)
+
+
+def interquartile_ratio(values: List[float]) -> float:
+    """IQR normalised by median."""
+    if not values:
+        return 0.0
+    q1 = percentile(values, 25.0)
+    q3 = percentile(values, 75.0)
+    med = median_val(values)
+    if abs(med) < 1e-12:
+        return 0.0
+    return (q3 - q1) / abs(med)
+
+
+# ════════════════════════════════════════════════════════════════════════════════
+#  Statistical Testing & Confidence
+# ════════════════════════════════════════════════════════════════════════════════
+
+def _inverse_normal_cdf(p: float) -> float:
+    """Rational approximation to inverse normal CDF (Abramowitz & Stegun)."""
+    if p <= 0.0:
+        return -8.0
+    if p >= 1.0:
+        return 8.0
+    if p < 0.5:
+        return -_inverse_normal_cdf(1.0 - p)
+    t = math.sqrt(-2.0 * _safe_log(1.0 - p))
+    c0, c1, c2 = 2.515517, 0.802853, 0.010328
+    d1, d2, d3 = 1.432788, 0.189269, 0.001308
+    return t - (c0 + c1 * t + c2 * t * t) / (1.0 + d1 * t + d2 * t * t + d3 * t * t * t)
+
+
+def _normal_cdf(x: float) -> float:
+    """Approximation to the standard normal CDF."""
+    return 0.5 * (1.0 + math.erf(x / math.sqrt(2.0)))
+
+
+def bootstrap_confidence_interval(
+    values: List[float],
+    stat_fn=None,
+    n_resamples: int = 2000,
+    confidence: float = 0.95,
+    rng=None,
+) -> Dict[str, float]:
+    """
+    Non-parametric BCa bootstrap confidence interval.
+    Returns mean, std, ci_lower, ci_upper, and se.
+    """
+    import numpy as _np
+
+    if stat_fn is None:
+        stat_fn = lambda arr: float(_np.mean(arr))
+
+    if rng is None:
+        rng = _np.random.default_rng(42)
+
+    arr = _np.array(values, dtype=float)
+    n = len(arr)
+    if n < 2:
+        val = float(arr[0]) if n == 1 else 0.0
+        return {"mean": val, "std": 0.0, "ci_lower": val, "ci_upper": val, "se": 0.0}
+
+    observed = stat_fn(arr)
+
+    # jackknife for acceleration
+    jackknife_stats = _np.empty(n)
+    for i in range(n):
+        jack_sample = _np.concatenate([arr[:i], arr[i + 1:]])
+        jackknife_stats[i] = stat_fn(jack_sample)
+    jack_mean = float(_np.mean(jackknife_stats))
+    diff = jack_mean - jackknife_stats
+    numer_acc = float(_np.sum(diff ** 3))
+    denom_acc = 6.0 * float(_np.sum(diff ** 2)) ** 1.5
+    acceleration = numer_acc / denom_acc if abs(denom_acc) > 1e-15 else 0.0
+
+    # bootstrap resamples
+    boot_stats = _np.empty(n_resamples)
+    for b in range(n_resamples):
+        idx = rng.integers(0, n, size=n)
+        boot_stats[b] = stat_fn(arr[idx])
+
+    prop_below = max(1e-6, min(1 - 1e-6, float(_np.mean(boot_stats < observed))))
+    z0 = _inverse_normal_cdf(prop_below)
+
+    alpha = 1.0 - confidence
+    z_alpha_lo = _inverse_normal_cdf(alpha / 2.0)
+    z_alpha_hi = _inverse_normal_cdf(1.0 - alpha / 2.0)
+
+    def _bca_percentile(z_alpha: float) -> float:
+        numer_adj = z0 + z_alpha
+        denom_adj = 1.0 - acceleration * numer_adj
+        if abs(denom_adj) < 1e-15:
+            return z_alpha
+        adjusted = z0 + numer_adj / denom_adj
+        p_val = _normal_cdf(adjusted) * 100.0
+        return float(_np.percentile(boot_stats, max(0.0, min(100.0, p_val))))
+
+    ci_lower = _bca_percentile(z_alpha_lo)
+    ci_upper = _bca_percentile(z_alpha_hi)
+
+    return {
+        "mean": float(observed),
+        "std": float(_np.std(boot_stats)),
+        "ci_lower": ci_lower,
+        "ci_upper": ci_upper,
+        "se": float(_np.std(boot_stats)),
+    }
+
+
+def mann_whitney_u_test(sample_a: List[float], sample_b: List[float]) -> Dict[str, float]:
+    """
+    Mann-Whitney U test (non-parametric two-sample).
+    Returns U statistic, z-score, approximate two-tailed p-value.
+    """
+    na, nb = len(sample_a), len(sample_b)
+    if na == 0 or nb == 0:
+        return {"U": 0.0, "z": 0.0, "p_value": 1.0}
+
+    combined = [(v, 0) for v in sample_a] + [(v, 1) for v in sample_b]
+    combined.sort(key=lambda x: x[0])
+
+    ranks = [0.0] * len(combined)
+    i = 0
+    while i < len(combined):
+        j = i
+        while j < len(combined) and combined[j][0] == combined[i][0]:
+            j += 1
+        avg_rank = (i + j + 1) / 2.0
+        for k in range(i, j):
+            ranks[k] = avg_rank
+        i = j
+
+    r1 = sum(ranks[k] for k in range(len(combined)) if combined[k][1] == 0)
+    u1 = r1 - na * (na + 1) / 2.0
+    u2 = na * nb - u1
+    u_stat = min(u1, u2)
+
+    mu_u = na * nb / 2.0
+    sigma_u = math.sqrt(na * nb * (na + nb + 1) / 12.0)
+    z = (u_stat - mu_u) / max(sigma_u, 1e-15)
+    p_value = 2.0 * _normal_cdf(-abs(z))
+    return {"U": u_stat, "z": z, "p_value": p_value}
+
+
+def wilcoxon_signed_rank(differences: List[float]) -> Dict[str, float]:
+    """Wilcoxon signed rank test for paired samples."""
+    nonzero = [(abs(d), 1 if d > 0 else -1) for d in differences if abs(d) > 1e-15]
+    n = len(nonzero)
+    if n == 0:
+        return {"T": 0.0, "z": 0.0, "p_value": 1.0}
+
+    nonzero.sort(key=lambda x: x[0])
+    ranks = [0.0] * n
+    i = 0
+    while i < n:
+        j = i
+        while j < n and nonzero[j][0] == nonzero[i][0]:
+            j += 1
+        avg_rank = (i + j + 1) / 2.0
+        for k in range(i, j):
+            ranks[k] = avg_rank
+        i = j
+
+    w_plus = sum(ranks[k] for k in range(n) if nonzero[k][1] > 0)
+    w_minus = sum(ranks[k] for k in range(n) if nonzero[k][1] < 0)
+    t_stat = min(w_plus, w_minus)
+
+    mu_t = n * (n + 1) / 4.0
+    sigma_t = math.sqrt(n * (n + 1) * (2 * n + 1) / 24.0)
+    z = (t_stat - mu_t) / max(sigma_t, 1e-15)
+    p_value = 2.0 * _normal_cdf(-abs(z))
+    return {"T": t_stat, "z": z, "p_value": p_value}
+
+
+def kolmogorov_smirnov_2sample(
+    sample_a: List[float], sample_b: List[float]
+) -> Dict[str, float]:
+    """Two-sample Kolmogorov-Smirnov test. Returns KS stat and asymptotic p-value."""
+    na, nb = len(sample_a), len(sample_b)
+    if na == 0 or nb == 0:
+        return {"ks_stat": 0.0, "p_value": 1.0}
+
+    sa = sorted(sample_a)
+    sb = sorted(sample_b)
+    all_vals = sorted(set(sa + sb))
+    max_diff = 0.0
+
+    def ecdf(sorted_data: List[float], x: float) -> float:
+        count = sum(1 for v in sorted_data if v <= x)
+        return count / len(sorted_data)
+
+    for v in all_vals:
+        diff = abs(ecdf(sa, v) - ecdf(sb, v))
+        if diff > max_diff:
+            max_diff = diff
+
+    en = math.sqrt(na * nb / max(na + nb, 1))
+    lam = (en + 0.12 + 0.11 / max(en, 1e-15)) * max_diff
+    p_value = max(0.0, min(1.0, 2.0 * math.exp(-2.0 * lam * lam) if lam > 0 else 1.0))
+    return {"ks_stat": max_diff, "p_value": p_value}
+
+
+# ════════════════════════════════════════════════════════════════════════════════
+#  Welfare Functions
+# ════════════════════════════════════════════════════════════════════════════════
+
+def utilitarian_welfare(values: List[float]) -> float:
+    """Benthamite utilitarian: W = sum(u_i)."""
+    return sum(values)
+
+
+def rawlsian_welfare(values: List[float]) -> float:
+    """Rawlsian max-min: W = min(u_i)."""
+    return min(values) if values else 0.0
+
+
+def nash_welfare(values: List[float]) -> float:
+    """Nash social welfare (geometric mean): W = (prod max(u_i, eps))^(1/n)."""
+    if not values:
+        return 0.0
+    n = len(values)
+    log_sum = sum(_safe_log(max(v, 1e-12)) for v in values)
+    return math.exp(log_sum / n)
+
+
+def bernoulli_nash_welfare(values: List[float], rho: float = 0.5) -> float:
+    """Bernoulli-Nash with CRRA utility: u(x) = x^(1-rho)/(1-rho)."""
+    if not values:
+        return 0.0
+    if abs(rho - 1.0) < 1e-9:
+        return sum(_safe_log(max(v, 1e-12)) for v in values) / len(values)
+    exp = 1.0 - rho
+    return sum(max(v, 1e-12) ** exp / exp for v in values) / len(values)
+
+
+def prioritarian_welfare(values: List[float], concavity: float = 0.5) -> float:
+    """Prioritarian welfare: W = sum(u_i^c) / n where c < 1 prioritises the worse-off."""
+    if not values:
+        return 0.0
+    return sum(max(v, 1e-12) ** concavity for v in values) / len(values)
+
+
+# ════════════════════════════════════════════════════════════════════════════════
+#  Risk Metrics
+# ════════════════════════════════════════════════════════════════════════════════
+
+def value_at_risk(values: List[float], alpha: float = 0.05) -> float:
+    """Value at Risk at confidence (1-alpha). Returns the alpha-th percentile."""
+    return percentile(values, alpha * 100.0)
+
+
+def conditional_value_at_risk(values: List[float], alpha: float = 0.05) -> float:
+    """CVaR / Expected Shortfall: E[X | X <= VaR_alpha(X)]."""
+    if not values:
+        return 0.0
+    ordered = sorted(values)
+    n = len(ordered)
+    cutoff = max(1, int(math.ceil(alpha * n)))
+    return mean(ordered[:cutoff])
+
+
+def sharpe_ratio(values: List[float], risk_free: float = 0.0) -> float:
+    """Reward-to-variability ratio: S = (mu - r_f) / sigma."""
+    mu = mean(values)
+    sigma = std(values, ddof=1)
+    if sigma < 1e-12:
+        return 0.0
+    return (mu - risk_free) / sigma
+
+
+def sortino_ratio(values: List[float], target: float = 0.0) -> float:
+    """Sortino ratio: excess return divided by downside deviation."""
+    mu = mean(values)
+    downside = [max(0.0, target - v) ** 2 for v in values]
+    dd = math.sqrt(mean(downside))
+    if dd < 1e-12:
+        return 0.0
+    return (mu - target) / dd
+
+
+def max_drawdown(values: List[float]) -> float:
+    """Maximum peak-to-trough decline in cumulative reward."""
+    if not values:
+        return 0.0
+    peak = values[0]
+    max_dd = 0.0
+    for v in values:
+        if v > peak:
+            peak = v
+        dd = peak - v
+        if dd > max_dd:
+            max_dd = dd
+    return max_dd
+
+
+# ════════════════════════════════════════════════════════════════════════════════
+#  Distributional Divergence Metrics
+# ════════════════════════════════════════════════════════════════════════════════
+
+def policy_entropy(action_probs: List[float]) -> float:
+    """Shannon entropy of a discrete distribution: H = -sum(p * ln(p))."""
+    return -sum(p * _safe_log(p) for p in action_probs if p > 1e-15)
+
+
+def normalised_entropy(action_probs: List[float]) -> float:
+    """Entropy normalised by maximum possible (uniform)."""
+    n = len(action_probs)
+    if n <= 1:
+        return 0.0
+    h_max = math.log(n)
+    if h_max < 1e-15:
+        return 0.0
+    return policy_entropy(action_probs) / h_max
+
+
+def kl_divergence(p: List[float], q: List[float]) -> float:
+    """Kullback-Leibler divergence D_KL(P || Q)."""
+    if len(p) != len(q):
+        return float("inf")
+    return sum(
+        pi * (_safe_log(pi) - _safe_log(max(qi, 1e-15)))
+        for pi, qi in zip(p, q)
+        if pi > 1e-15
+    )
+
+
+def jensen_shannon_divergence(p: List[float], q: List[float]) -> float:
+    """Jensen-Shannon divergence (symmetric, bounded in [0, ln 2])."""
+    if len(p) != len(q):
+        return float("inf")
+    m = [(pi + qi) / 2.0 for pi, qi in zip(p, q)]
+    return 0.5 * kl_divergence(p, m) + 0.5 * kl_divergence(q, m)
+
+
+def wasserstein_1d(values_a: List[float], values_b: List[float]) -> float:
+    """Wasserstein-1 distance between two 1D empirical distributions."""
+    if not values_a or not values_b:
+        return 0.0
+    sa = sorted(values_a)
+    sb = sorted(values_b)
+    n = max(len(sa), len(sb))
+
+    def _interp(arr: List[float], n_out: int) -> List[float]:
+        m = len(arr)
+        if m == n_out:
+            return list(arr)
+        out = []
+        for i in range(n_out):
+            t = i * (m - 1) / max(n_out - 1, 1)
+            lo = int(math.floor(t))
+            hi = min(lo + 1, m - 1)
+            frac = t - lo
+            out.append(arr[lo] * (1 - frac) + arr[hi] * frac)
+        return out
+
+    ra = _interp(sa, n)
+    rb = _interp(sb, n)
+    return sum(abs(a - b) for a, b in zip(ra, rb)) / n
+
+
+def total_variation_distance(p: List[float], q: List[float]) -> float:
+    """Total variation distance: TV = 0.5 * sum |p_i - q_i|."""
+    if len(p) != len(q):
+        return 1.0
+    return 0.5 * sum(abs(pi - qi) for pi, qi in zip(p, q))
+
+
+# ════════════════════════════════════════════════════════════════════════════════
+#  Convergence & Time-Series Diagnostics
+# ════════════════════════════════════════════════════════════════════════════════
+
+def autocorrelation(values: List[float], lag: int = 1) -> float:
+    """Sample autocorrelation at a given lag."""
+    n = len(values)
+    if n < lag + 2:
+        return 0.0
+    mu = mean(values)
+    var_total = sum((v - mu) ** 2 for v in values) / n
+    if var_total < 1e-15:
+        return 0.0
+    cov = sum((values[i] - mu) * (values[i + lag] - mu) for i in range(n - lag)) / n
+    return cov / var_total
+
+
+def ewma(values: List[float], span: int = 20) -> List[float]:
+    """Exponentially Weighted Moving Average."""
+    if not values:
+        return []
+    alpha = 2.0 / (span + 1)
+    smoothed = [values[0]]
+    for v in values[1:]:
+        smoothed.append(alpha * v + (1 - alpha) * smoothed[-1])
+    return smoothed
+
+
+def linear_slope(values: List[float]) -> float:
+    """OLS slope of values vs index."""
+    n = len(values)
+    if n < 2:
+        return 0.0
+    x_mean = (n - 1) / 2.0
+    y_mean = mean(values)
+    num = sum((i - x_mean) * (values[i] - y_mean) for i in range(n))
+    den = sum((i - x_mean) ** 2 for i in range(n))
+    return num / den if den > 1e-15 else 0.0
+
+
+def convergence_rate(values: List[float], window: int = 20) -> float:
+    """Convergence rate: improvement ratio in last vs first window."""
+    if len(values) < 2 * window:
+        return linear_slope(values)
+    first_w = mean(values[:window])
+    last_w = mean(values[-window:])
+    mid_start = len(values) // 2 - window // 2
+    mid_w = mean(values[mid_start: mid_start + window])
+    if abs(first_w - mid_w) < 1e-12:
+        return 0.0
+    return (last_w - mid_w) / abs(first_w - mid_w)
+
+
+def effective_sample_size(log_weights: List[float]) -> float:
+    """Effective sample size for importance-weighted estimators (log-space stable)."""
+    if not log_weights:
+        return 0.0
+    max_lw = max(log_weights)
+    weights = [math.exp(lw - max_lw) for lw in log_weights]
+    total = sum(weights)
+    total_sq = sum(w * w for w in weights)
+    if total_sq < 1e-15:
+        return 0.0
+    return (total * total) / total_sq
+
+
+# ════════════════════════════════════════════════════════════════════════════════
+#  Intersectional Fairness
+# ════════════════════════════════════════════════════════════════════════════════
+
+def intersectional_disparity_matrix(
+    subgroup_rfb: Dict[str, List[float]],
+) -> Dict[str, Dict[str, float]]:
+    """Pairwise |mean_i - mean_j| disparity for all subgroup pairs."""
+    means = {k: mean(v) for k, v in subgroup_rfb.items() if v}
+    matrix: Dict[str, Dict[str, float]] = {}
+    for k1, m1 in means.items():
+        row: Dict[str, float] = {}
+        for k2, m2 in means.items():
+            row[k2] = abs(m1 - m2)
+        matrix[k1] = row
+    return matrix
+
+
+def max_intersectional_gap(subgroup_rfb: Dict[str, List[float]]) -> float:
+    """Maximum pairwise gap in means across all subgroups."""
+    means = [mean(v) for v in subgroup_rfb.values() if v]
+    if len(means) < 2:
+        return 0.0
+    return max(means) - min(means)
+
+
+def demographic_parity_ratio(subgroup_rfb: Dict[str, List[float]]) -> float:
+    """Demographic parity ratio: min(mean) / max(mean). Perfect parity = 1.0."""
+    means = [mean(v) for v in subgroup_rfb.values() if v]
+    if not means:
+        return 1.0
+    max_val = max(means)
+    min_val = min(means)
+    if max_val < 1e-12:
+        return 1.0
+    return min_val / max_val
+
+
+# ════════════════════════════════════════════════════════════════════════════════
+#  Composite Scoring
+# ════════════════════════════════════════════════════════════════════════════════
+
+def composite_healthcare_score(
+    clinical: float,
+    equity: float,
+    adherence: float,
+    cost_efficiency: float,
+    reward: float,
+    weights: Optional[Dict[str, float]] = None,
+) -> float:
+    """Weighted composite score for healthcare RL policy evaluation."""
+    w = weights or {
+        "clinical": 1.40,
+        "equity": 2.30,
+        "adherence": 1.10,
+        "cost_efficiency": 0.80,
+        "reward": 1.00,
+    }
+    return (
+        w.get("clinical", 1.4) * clinical
+        + w.get("equity", 2.3) * equity
+        + w.get("adherence", 1.1) * adherence
+        + w.get("cost_efficiency", 0.8) * cost_efficiency
+        + w.get("reward", 1.0) * reward
+    )

@@ -1,0 +1,1054 @@
+"""
+Simulation Orchestration Layer
+════════════════════════════════════
+
+Manages the full lifecycle of RL experiments:
+  • Auto-tuning via Bayesian-inspired grid search with caching
+  • Parallel multi-algorithm comparison (8 baselines + 1 proposed)
+  • SSE real-time streaming of training progress
+  • Ablation studio (9 component toggles)
+  • Scenario lab (6 healthcare scenarios, side-by-side)
+  • Counterfactual explainer (5 treatment arms)
+  • Sensitivity analysis (parameter sweeps)
+  • Convergence diagnostics (autocorrelation, EWMA, effective sample size)
+"""
+
+from __future__ import annotations
+
+from dataclasses import asdict
+from typing import Callable, Dict, Generator, List, Tuple
+import queue
+import threading
+import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
+
+import numpy as np
+
+from rl.algorithms import QLearningAgent, TrainingConfig, evaluate_algorithm, train_algorithm
+from rl.environment import HealthcareEnvironment
+
+
+_AUTOTUNE_CACHE: Dict[Tuple, Tuple[TrainingConfig, Dict]] = {}
+_AUTOTUNE_CACHE_LOCK = threading.Lock()
+
+
+ALGORITHMS = [
+    {
+        "id": "clinical",
+        "name": "Clinical Q-Learning",
+        "paper_link": "Conventional RL objective",
+        "color": "#22d3ee",
+    },
+    {
+        "id": "cost_sensitive",
+        "name": "Cost-Sensitive Q-Learning",
+        "paper_link": "Cost-aware reward shaping",
+        "color": "#818cf8",
+    },
+    {
+        "id": "multi_objective",
+        "name": "Multi-Objective Q-Learning",
+        "paper_link": "Multi-objective deep Q-learning line of work",
+        "color": "#fb923c",
+    },
+    {
+        "id": "primal_dual",
+        "name": "Primal-Dual Constrained Q-Learning",
+        "paper_link": "Safe RL via primal-dual constraints",
+        "color": "#f472b6",
+    },
+    {
+        "id": "sarsa",
+        "name": "SARSA with Eligibility Traces",
+        "paper_link": "On-policy TD(λ) with eligibility traces (Sutton & Barto, 2018)",
+        "color": "#a78bfa",
+    },
+    {
+        "id": "soft_q",
+        "name": "Entropy-Regularised Soft Q-Learning",
+        "paper_link": "Soft Q-Learning (Haarnoja et al., 2017)",
+        "color": "#2dd4bf",
+    },
+    {
+        "id": "cvar_sensitive",
+        "name": "CVaR-Sensitive Q-Learning",
+        "paper_link": "Risk-sensitive RL via CVaR optimisation (Tamar et al., 2015)",
+        "color": "#fbbf24",
+    },
+    {
+        "id": "actor_critic",
+        "name": "Tabular Actor-Critic",
+        "paper_link": "Advantage Actor-Critic with entropy regularisation (Mnih et al., 2016)",
+        "color": "#e879f9",
+    },
+    {
+        "id": "fairness_constrained",
+        "name": "Proposed Fairness-Constrained Q-Learning",
+        "paper_link": "RFB + Gini-penalized objective with multi-inequality constraints",
+        "color": "#4ade80",
+    },
+]
+
+
+def parse_config(payload: Dict) -> TrainingConfig:
+    base = TrainingConfig()
+    updates = {}
+    for key in asdict(base):
+        if key in payload:
+            updates[key] = payload[key]
+    return TrainingConfig(**{**asdict(base), **updates})
+
+
+def _apply_ablation_and_runtime_overrides(cfg: TrainingConfig, payload: Dict) -> TrainingConfig:
+    updated = TrainingConfig(**asdict(cfg))
+
+    ablations = payload.get("ablations") or {}
+    if isinstance(ablations, dict):
+        updated.enable_fairness_term = bool(ablations.get("fairness_term", updated.enable_fairness_term))
+        updated.enable_action_shielding = bool(ablations.get("shielding", updated.enable_action_shielding))
+        updated.enable_prioritized_replay = bool(ablations.get("replay", updated.enable_prioritized_replay))
+        updated.enable_double_q = bool(ablations.get("double_q", updated.enable_double_q))
+        updated.enable_episode_shaping = bool(ablations.get("episode_shaping", updated.enable_episode_shaping))
+        updated.enable_eligibility_traces = bool(ablations.get("eligibility_traces", updated.enable_eligibility_traces))
+        updated.enable_boltzmann_exploration = bool(ablations.get("boltzmann_exploration", updated.enable_boltzmann_exploration))
+        updated.enable_ucb_exploration = bool(ablations.get("ucb_exploration", updated.enable_ucb_exploration))
+        updated.enable_curriculum_learning = bool(ablations.get("curriculum_learning", updated.enable_curriculum_learning))
+        updated.enable_hindsight_relabelling = bool(ablations.get("hindsight_relabelling", updated.enable_hindsight_relabelling))
+        updated.enable_multi_inequality = bool(ablations.get("multi_inequality", updated.enable_multi_inequality))
+
+    score_weights = payload.get("score_weights") or {}
+    if isinstance(score_weights, dict):
+        updated.fairness_lambda = float(score_weights.get("fairness_lambda", updated.fairness_lambda))
+        updated.cvar_alpha = float(score_weights.get("cvar_alpha", updated.cvar_alpha))
+        updated.soft_q_temperature = float(score_weights.get("soft_q_temperature", updated.soft_q_temperature))
+
+    sota = payload.get("sota_params") or {}
+    if isinstance(sota, dict):
+        if "soft_q_temperature" in sota:
+            updated.soft_q_temperature = float(sota["soft_q_temperature"])
+        if "cvar_alpha" in sota:
+            updated.cvar_alpha = float(sota["cvar_alpha"])
+        if "n_step" in sota:
+            updated.n_step = int(sota["n_step"])
+        if "eligibility_lambda" in sota:
+            updated.eligibility_lambda = float(sota["eligibility_lambda"])
+
+    return updated
+
+
+def _build_environment(payload: Dict) -> HealthcareEnvironment:
+    scenario = str(payload.get("scenario", "baseline"))
+    drift = payload.get("drift") if isinstance(payload.get("drift"), dict) else {}
+    return HealthcareEnvironment(
+        scenario=scenario,
+        drift_cost_inflation=float(drift.get("cost_inflation", 0.0)),
+        drift_adherence_drop=float(drift.get("adherence_drop", 0.0)),
+        drift_efficacy_drop=float(drift.get("efficacy_drop", 0.0)),
+    )
+
+
+def _autotune_objective(metrics: Dict[str, float]) -> float:
+    return (
+        1.00 * metrics.get("reward", 0.0)
+        + 1.25 * metrics.get("clinical_improvement", 0.0)
+        + 0.90 * metrics.get("adherence", 0.0)
+        + 1.60 * metrics.get("equity_index", 0.0)
+        - 0.20 * metrics.get("avg_rfb", 0.0)
+        - 0.15 * metrics.get("theil_index", 0.0)
+        - 0.10 * metrics.get("atkinson_index", 0.0)
+        + 0.30 * metrics.get("sharpe_ratio", 0.0)
+    )
+
+
+def _autotune_cache_key(cfg: TrainingConfig) -> tuple:
+    return (
+        round(cfg.fairness_lambda, 3),
+        round(cfg.cost_weight, 3),
+        round(cfg.learning_rate, 4),
+        round(cfg.epsilon_decay, 4),
+        cfg.episodes,
+        cfg.horizon,
+        cfg.cohort_size,
+        cfg.seed,
+    )
+
+
+def _quick_autotune_config(
+    cfg: TrainingConfig,
+    progress_hook: Callable[[Dict], None] | None = None,
+) -> tuple[TrainingConfig, Dict]:
+    cache_key = _autotune_cache_key(cfg)
+    with _AUTOTUNE_CACHE_LOCK:
+        cached = _AUTOTUNE_CACHE.get(cache_key)
+    if cached is not None:
+        tuned_cfg, tune_info = cached
+        cached_info = {**tune_info, "cached": True}
+        if progress_hook:
+            progress_hook({"status": "cache_hit", "tested": cached_info.get("tested_configs", 0), "total": cached_info.get("tested_configs", 0), "best_params": cached_info.get("best_params", {})})
+        return TrainingConfig(**asdict(tuned_cfg)), cached_info
+
+    fairness_algo = next(item for item in ALGORITHMS if item["id"] == "fairness_constrained")
+
+    tune_cfg = TrainingConfig(**asdict(cfg))
+    tune_cfg.episodes = max(16, min(30, cfg.episodes // 6 if cfg.episodes > 1 else 16))
+    tune_cfg.cohort_size = max(12, min(24, cfg.cohort_size // 6 if cfg.cohort_size > 1 else 12))
+    tune_cfg.horizon = max(6, min(10, cfg.horizon // 2 if cfg.horizon > 1 else 6))
+
+    fairness_candidates = sorted(
+        {
+            round(max(0.0, cfg.fairness_lambda - 0.10), 3),
+            round(cfg.fairness_lambda, 3),
+            round(min(1.6, cfg.fairness_lambda + 0.10), 3),
+        }
+    )
+    cost_candidates = sorted(
+        {
+            round(max(0.2, cfg.cost_weight - 0.08), 3),
+            round(cfg.cost_weight, 3),
+            round(min(1.2, cfg.cost_weight + 0.08), 3),
+        }
+    )
+    lr_candidates = sorted(
+        {
+            round(max(0.06, cfg.learning_rate * 0.85), 3),
+            round(cfg.learning_rate, 3),
+            round(min(0.28, cfg.learning_rate * 1.10), 3),
+        }
+    )
+    eps_decay_candidates = sorted(
+        {
+            round(cfg.epsilon_decay, 4),
+            round(min(0.995, cfg.epsilon_decay + 0.003), 4),
+        }
+    )
+
+    seed_candidates = [cfg.seed]
+    all_combos = [
+        (fairness_lambda, cost_weight, learning_rate, epsilon_decay)
+        for fairness_lambda in fairness_candidates
+        for cost_weight in cost_candidates
+        for learning_rate in lr_candidates
+        for epsilon_decay in eps_decay_candidates
+    ]
+    max_trials = min(12, len(all_combos))
+    if len(all_combos) > max_trials:
+        step = len(all_combos) / max_trials
+        sampled = []
+        for idx in range(max_trials):
+            sampled.append(all_combos[min(len(all_combos) - 1, int(idx * step))])
+        combo_list = sampled
+    else:
+        combo_list = all_combos
+
+    best_score = float("-inf")
+    best_params: Dict[str, float] = {
+        "fairness_lambda": cfg.fairness_lambda,
+        "cost_weight": cfg.cost_weight,
+        "learning_rate": cfg.learning_rate,
+        "epsilon_decay": cfg.epsilon_decay,
+    }
+    best_metrics: Dict[str, float] = {}
+    tested = 0
+    time_budget_seconds = 8.0
+    start_time = time.monotonic()
+
+    for fairness_lambda, cost_weight, learning_rate, epsilon_decay in combo_list:
+        metrics_by_seed = []
+        for seed in seed_candidates:
+            eval_cfg = TrainingConfig(**asdict(tune_cfg))
+            eval_cfg.fairness_lambda = fairness_lambda
+            eval_cfg.cost_weight = cost_weight
+            eval_cfg.learning_rate = learning_rate
+            eval_cfg.epsilon_decay = epsilon_decay
+            eval_cfg.seed = seed
+            row, _ = _run_single_algorithm(fairness_algo, eval_cfg)
+            metrics_by_seed.append(row)
+
+        mean_metrics = {
+            "reward": float(np.mean([item["reward"] for item in metrics_by_seed])),
+            "clinical_improvement": float(np.mean([item["clinical_improvement"] for item in metrics_by_seed])),
+            "adherence": float(np.mean([item["adherence"] for item in metrics_by_seed])),
+            "equity_index": float(np.mean([item["equity_index"] for item in metrics_by_seed])),
+            "avg_rfb": float(np.mean([item["avg_rfb"] for item in metrics_by_seed])),
+        }
+
+        score = _autotune_objective(mean_metrics)
+        tested += 1
+        if score > best_score:
+            best_score = score
+            best_params = {
+                "fairness_lambda": fairness_lambda,
+                "cost_weight": cost_weight,
+                "learning_rate": learning_rate,
+                "epsilon_decay": epsilon_decay,
+            }
+            best_metrics = mean_metrics
+
+        if progress_hook:
+            progress_hook(
+                {
+                    "status": "running",
+                    "tested": tested,
+                    "total": len(combo_list),
+                    "current_params": {
+                        "fairness_lambda": fairness_lambda,
+                        "cost_weight": cost_weight,
+                        "learning_rate": learning_rate,
+                        "epsilon_decay": epsilon_decay,
+                    },
+                    "best_params": best_params,
+                }
+            )
+
+        if (time.monotonic() - start_time) >= time_budget_seconds:
+            break
+
+    tuned_cfg = TrainingConfig(**asdict(cfg))
+    tuned_cfg.fairness_lambda = float(best_params["fairness_lambda"])
+    tuned_cfg.cost_weight = float(best_params["cost_weight"])
+    tuned_cfg.learning_rate = float(best_params["learning_rate"])
+    tuned_cfg.epsilon_decay = float(best_params["epsilon_decay"])
+
+    tune_info = {
+        "enabled": True,
+        "cached": False,
+        "tested_configs": tested,
+        "search_space": {
+            "fairness_lambda": fairness_candidates,
+            "cost_weight": cost_candidates,
+            "learning_rate": lr_candidates,
+            "epsilon_decay": eps_decay_candidates,
+            "max_trials": max_trials,
+        },
+        "best_params": best_params,
+        "best_objective": best_score,
+        "best_metrics": best_metrics,
+        "tune_budget": {
+            "episodes": tune_cfg.episodes,
+            "cohort_size": tune_cfg.cohort_size,
+            "horizon": tune_cfg.horizon,
+            "seeds": seed_candidates,
+            "time_budget_seconds": time_budget_seconds,
+        },
+    }
+
+    with _AUTOTUNE_CACHE_LOCK:
+        _AUTOTUNE_CACHE[cache_key] = (TrainingConfig(**asdict(tuned_cfg)), tune_info)
+
+    return tuned_cfg, tune_info
+
+
+def prepare_config(payload: Dict) -> tuple[TrainingConfig, Dict]:
+    cfg = parse_config(payload)
+    auto_tune = payload.get("auto_tune", True)
+    if not auto_tune:
+        return cfg, {"enabled": False}
+    tuned_cfg, tune_info = _quick_autotune_config(cfg)
+    return tuned_cfg, tune_info
+
+
+def _algo_seed_offset(algo_id: str) -> int:
+    return sum((index + 1) * ord(char) for index, char in enumerate(algo_id))
+
+
+def _run_single_algorithm(algo: Dict, cfg: TrainingConfig) -> tuple[dict, dict]:
+    env = HealthcareEnvironment()
+    seed_offset = _algo_seed_offset(algo["id"])
+    rng_train = np.random.default_rng(cfg.seed + seed_offset)
+    rng_eval = np.random.default_rng(cfg.seed + 999 + seed_offset)
+    agent = QLearningAgent(env.action_count, cfg)
+
+    training_history = train_algorithm(agent, env, algo["id"], cfg, rng_train)
+    evaluation = evaluate_algorithm(agent, env, algo["id"], cfg, rng_eval)
+
+    row = {
+        "algorithm_id": algo["id"],
+        "algorithm": algo["name"],
+        "reference": algo["paper_link"],
+        "color": algo.get("color", "#ffffff"),
+        **evaluation,
+    }
+    series = {
+        "algorithm_id": algo["id"],
+        "algorithm": algo["name"],
+        "episode_rewards": training_history["episode_rewards"],
+        "episode_gini": training_history["episode_gini"],
+        "episode_adherence": training_history["episode_adherence"],
+        "episode_clinical": training_history["episode_clinical"],
+        "episode_theil": training_history.get("episode_theil", []),
+        "episode_cvar": training_history.get("episode_cvar", []),
+        "episode_entropy": training_history.get("episode_entropy", []),
+    }
+    return row, series
+
+
+def _run_single_algorithm_with_payload(algo: Dict, cfg: TrainingConfig, payload: Dict) -> tuple[dict, dict]:
+    env = _build_environment(payload)
+    seed_offset = _algo_seed_offset(algo["id"])
+    rng_train = np.random.default_rng(cfg.seed + seed_offset)
+    rng_eval = np.random.default_rng(cfg.seed + 999 + seed_offset)
+    agent = QLearningAgent(env.action_count, cfg)
+
+    training_history = train_algorithm(agent, env, algo["id"], cfg, rng_train)
+    evaluation = evaluate_algorithm(agent, env, algo["id"], cfg, rng_eval)
+
+    row = {
+        "algorithm_id": algo["id"],
+        "algorithm": algo["name"],
+        "reference": algo["paper_link"],
+        "color": algo.get("color", "#ffffff"),
+        **evaluation,
+    }
+    series = {
+        "algorithm_id": algo["id"],
+        "algorithm": algo["name"],
+        "episode_rewards": training_history["episode_rewards"],
+        "episode_gini": training_history["episode_gini"],
+        "episode_adherence": training_history["episode_adherence"],
+        "episode_clinical": training_history["episode_clinical"],
+        "episode_theil": training_history.get("episode_theil", []),
+        "episode_cvar": training_history.get("episode_cvar", []),
+        "episode_entropy": training_history.get("episode_entropy", []),
+    }
+    return row, series
+
+
+def _attach_uncertainty(row: Dict, algo: Dict, cfg: TrainingConfig, payload: Dict) -> Dict:
+    seeds = payload.get("uncertainty_seeds", 3)
+    try:
+        seeds = int(seeds)
+    except (TypeError, ValueError):
+        seeds = 3
+    seeds = max(2, min(6, seeds))
+
+    metrics = {
+        "reward": [], "equity_index": [], "clinical_improvement": [],
+        "theil_index": [], "atkinson_index": [], "cvar_reward": [],
+        "sharpe_ratio": [], "intersectional_gap": [],
+    }
+    for offset in range(seeds):
+        test_cfg = TrainingConfig(**asdict(cfg))
+        test_cfg.episodes = max(24, min(70, cfg.episodes // 3 if cfg.episodes > 1 else 24))
+        test_cfg.horizon = max(8, min(14, cfg.horizon // 2 if cfg.horizon > 1 else 8))
+        test_cfg.cohort_size = max(24, min(60, cfg.cohort_size // 2 if cfg.cohort_size > 1 else 24))
+        test_cfg.seed = cfg.seed + 17 * offset
+        eval_row, _ = _run_single_algorithm_with_payload(algo, test_cfg, payload)
+        for key in metrics:
+            metrics[key].append(eval_row.get(key, 0.0))
+
+    uncertainty = {}
+    for key, values in metrics.items():
+        arr = np.array(values, dtype=float)
+        std = float(np.std(arr))
+        ci95 = float(1.96 * std / max(np.sqrt(len(arr)), 1.0))
+        uncertainty[key] = {
+            "mean": float(np.mean(arr)),
+            "std": std,
+            "ci95": ci95,
+            "lower": float(np.mean(arr) - ci95),
+            "upper": float(np.mean(arr) + ci95),
+        }
+
+    return {**row, "uncertainty": uncertainty, "uncertainty_seed_count": seeds}
+
+
+def run_comparison(payload: Dict) -> Dict:
+    cfg, autotune = prepare_config(payload)
+    cfg = _apply_ablation_and_runtime_overrides(cfg, payload)
+    selected = payload.get("selected_algorithms")
+    selected_ids = set(selected) if isinstance(selected, list) and selected else None
+
+    output = {
+        "config": asdict(cfg),
+        "autotune": autotune,
+        "results": [],
+        "series": [],
+    }
+
+    active_algorithms = [algo for algo in ALGORITHMS if not selected_ids or algo["id"] in selected_ids]
+    max_workers = max(1, min(8, len(active_algorithms)))
+
+    with ThreadPoolExecutor(max_workers=max_workers) as pool:
+        futures = {
+            pool.submit(_run_single_algorithm_with_payload, algo, cfg, payload): algo
+            for algo in active_algorithms
+        }
+        for future in as_completed(futures):
+            row, series = future.result()
+            row = _attach_uncertainty(row, futures[future], cfg, payload)
+            output["results"].append(row)
+            output["series"].append(series)
+
+    output["results"].sort(
+        key=lambda item: (
+            item.get("ranking_score", item.get("overall_score", item["reward"])),
+            item.get("overall_score", item["reward"]),
+            item["reward"],
+        ),
+        reverse=True,
+    )
+    return output
+
+
+def run_comparison_stream(payload: Dict) -> Generator[dict, None, None]:
+    auto_tune = payload.get("auto_tune", True)
+    if auto_tune:
+        yield {"type": "autotune_start", "message": "Auto-tuning fairness model parameters"}
+
+    cfg_base = parse_config(payload)
+    cfg = cfg_base
+    autotune = {"enabled": False}
+
+    if auto_tune:
+        tune_queue: queue.SimpleQueue = queue.SimpleQueue()
+        tune_result_box: dict = {}
+
+        def tune_hook(progress_data: Dict) -> None:
+            tune_queue.put({"type": "autotune_progress", **progress_data})
+
+        def tune_worker() -> None:
+            try:
+                tuned_cfg, tune_info = _quick_autotune_config(cfg_base, progress_hook=tune_hook)
+                tune_result_box["cfg"] = tuned_cfg
+                tune_result_box["autotune"] = tune_info
+            except Exception as exc:
+                tune_result_box["cfg"] = cfg_base
+                tune_result_box["autotune"] = {
+                    "enabled": False,
+                    "error": str(exc),
+                }
+                tune_queue.put({"type": "autotune_error", "message": str(exc)})
+            finally:
+                tune_queue.put({"type": "autotune_done"})
+
+        tune_thread = threading.Thread(target=tune_worker, daemon=True)
+        tune_thread.start()
+
+        last_keepalive = time.monotonic()
+        while True:
+            try:
+                tune_event = tune_queue.get(timeout=0.20)
+                if tune_event["type"] == "autotune_progress":
+                    yield tune_event
+                elif tune_event["type"] == "autotune_error":
+                    yield tune_event
+                elif tune_event["type"] == "autotune_done":
+                    break
+            except queue.Empty:
+                now = time.monotonic()
+                if now - last_keepalive >= 1.0:
+                    last_keepalive = now
+                    yield {"type": "autotune_keepalive", "message": "Auto-tuning in progress"}
+
+        tune_thread.join()
+        cfg = tune_result_box.get("cfg", cfg_base)
+        cfg = _apply_ablation_and_runtime_overrides(cfg, payload)
+        autotune = tune_result_box.get("autotune", {"enabled": False})
+        yield {"type": "autotune_result", "autotune": autotune, "config": asdict(cfg)}
+    else:
+        cfg, autotune = prepare_config(payload)
+        cfg = _apply_ablation_and_runtime_overrides(cfg, payload)
+
+    selected = payload.get("selected_algorithms")
+    selected_ids = set(selected) if isinstance(selected, list) and selected else None
+
+    yield {
+        "type": "start",
+        "config": asdict(cfg),
+        "autotune": autotune,
+    }
+
+    all_results = []
+    all_series = []
+    stream_errors = []
+    active_algorithms = [algo for algo in ALGORITHMS if not selected_ids or algo["id"] in selected_ids]
+    total_algorithms = len(active_algorithms)
+
+    if total_algorithms == 0:
+        yield {
+            "type": "complete",
+            "config": asdict(cfg),
+            "autotune": autotune,
+            "results": [],
+            "series": [],
+            "errors": [],
+        }
+        return
+
+    progress_queue: queue.SimpleQueue = queue.SimpleQueue()
+    done_counter = {"count": 0}
+    done_lock = threading.Lock()
+
+    def worker_runner(algo_index: int, algo: Dict) -> None:
+        try:
+            env = _build_environment(payload)
+            seed_offset = _algo_seed_offset(algo["id"])
+            rng_train = np.random.default_rng(cfg.seed + seed_offset)
+            rng_eval = np.random.default_rng(cfg.seed + 999 + seed_offset)
+            agent = QLearningAgent(env.action_count, cfg)
+
+            series_bundle = {
+                "algorithm_id": algo["id"],
+                "algorithm": algo["name"],
+                "episode_rewards": [],
+                "episode_gini": [],
+                "episode_adherence": [],
+                "episode_clinical": [],
+                "episode_theil": [],
+                "episode_cvar": [],
+                "episode_entropy": [],
+            }
+
+            def on_progress(progress: dict) -> None:
+                series_bundle["episode_rewards"].append(progress["reward"])
+                series_bundle["episode_gini"].append(progress["gini"])
+                series_bundle["episode_adherence"].append(progress["adherence"])
+                series_bundle["episode_clinical"].append(progress["clinical"])
+                series_bundle["episode_theil"].append(progress.get("theil", 0.0))
+                series_bundle["episode_cvar"].append(progress.get("cvar", 0.0))
+                series_bundle["episode_entropy"].append(progress.get("policy_entropy", 0.0))
+                progress_queue.put(
+                    {
+                        "type": "progress",
+                        "algorithm_id": algo["id"],
+                        "algorithm": algo["name"],
+                        "algorithm_index": algo_index,
+                        "algorithm_total": total_algorithms,
+                        "episode": progress["episode"],
+                        "episodes": progress["episodes"],
+                        "reward": progress["reward"],
+                        "gini": progress["gini"],
+                        "adherence": progress["adherence"],
+                        "clinical": progress["clinical"],
+                        "epsilon": progress.get("epsilon"),
+                        "dual_mu": progress.get("dual_mu"),
+                        "theil": progress.get("theil", 0.0),
+                        "cvar": progress.get("cvar", 0.0),
+                        "policy_entropy": progress.get("policy_entropy", 0.0),
+                    }
+                )
+
+            train_algorithm(agent, env, algo["id"], cfg, rng_train, progress_hook=on_progress)
+            evaluation = evaluate_algorithm(agent, env, algo["id"], cfg, rng_eval)
+
+            row = {
+                "algorithm_id": algo["id"],
+                "algorithm": algo["name"],
+                "reference": algo["paper_link"],
+                "color": algo.get("color", "#ffffff"),
+                **evaluation,
+            }
+            row = _attach_uncertainty(row, algo, cfg, payload)
+            progress_queue.put(
+                {
+                    "type": "algorithm_done",
+                    "algorithm_id": algo["id"],
+                    "result": row,
+                    "series": series_bundle,
+                }
+            )
+        except Exception as exc:
+            progress_queue.put(
+                {
+                    "type": "algorithm_error",
+                    "algorithm_id": algo["id"],
+                    "algorithm": algo["name"],
+                    "message": str(exc),
+                }
+            )
+        finally:
+            with done_lock:
+                done_counter["count"] += 1
+
+    workers: list[threading.Thread] = []
+    for algo_index, algo in enumerate(active_algorithms, start=1):
+        thread = threading.Thread(target=worker_runner, args=(algo_index, algo), daemon=True)
+        workers.append(thread)
+        thread.start()
+
+    last_keepalive = time.monotonic()
+    while True:
+        try:
+            event = progress_queue.get(timeout=0.05)
+            if event["type"] == "algorithm_done":
+                all_results.append(event["result"])
+                all_series.append(event["series"])
+            elif event["type"] == "algorithm_error":
+                stream_errors.append(
+                    {
+                        "algorithm_id": event["algorithm_id"],
+                        "algorithm": event["algorithm"],
+                        "message": event["message"],
+                    }
+                )
+            yield event
+        except queue.Empty:
+            with done_lock:
+                if done_counter["count"] >= total_algorithms:
+                    break
+            now = time.monotonic()
+            if now - last_keepalive >= 1.0:
+                last_keepalive = now
+                yield {
+                    "type": "stream_keepalive",
+                    "active_algorithms": total_algorithms - done_counter["count"],
+                }
+            time.sleep(0.01)
+
+    for thread in workers:
+        thread.join()
+
+    all_results.sort(
+        key=lambda item: (
+            item.get("ranking_score", item.get("overall_score", item["reward"])),
+            item.get("overall_score", item["reward"]),
+            item["reward"],
+        ),
+        reverse=True,
+    )
+    yield {
+        "type": "complete",
+        "config": asdict(cfg),
+        "autotune": autotune,
+        "results": all_results,
+        "series": all_series,
+        "errors": stream_errors,
+    }
+
+
+def run_ablation_studio(payload: Dict) -> Dict:
+    cfg, autotune = prepare_config(payload)
+    cfg = _apply_ablation_and_runtime_overrides(cfg, payload)
+    fairness_algo = next(item for item in ALGORITHMS if item["id"] == "fairness_constrained")
+
+    components = [
+        ("fairness_term", "enable_fairness_term"),
+        ("shielding", "enable_action_shielding"),
+        ("replay", "enable_prioritized_replay"),
+        ("double_q", "enable_double_q"),
+        ("episode_shaping", "enable_episode_shaping"),
+        ("eligibility_traces", "enable_eligibility_traces"),
+        ("curriculum_learning", "enable_curriculum_learning"),
+        ("hindsight_relabelling", "enable_hindsight_relabelling"),
+        ("multi_inequality", "enable_multi_inequality"),
+    ]
+
+    baseline_cfg = TrainingConfig(**asdict(cfg))
+    # Use reduced budget for interactive speed (10 runs total)
+    baseline_cfg.episodes = max(40, cfg.episodes // 2)
+    baseline_cfg.cohort_size = max(30, cfg.cohort_size // 2)
+    for _, attr in components:
+        setattr(baseline_cfg, attr, True)
+
+    baseline_row, _ = _run_single_algorithm_with_payload(fairness_algo, baseline_cfg, payload)
+
+    # Run all ablation experiments in parallel
+    def _run_ablation(component_name: str, attr: str):
+        ablated_cfg = TrainingConfig(**asdict(baseline_cfg))
+        setattr(ablated_cfg, attr, False)
+        row, _ = _run_single_algorithm_with_payload(fairness_algo, ablated_cfg, payload)
+        return {
+            "component": component_name,
+            "with_component": baseline_row,
+            "without_component": row,
+            "impact": {
+                "reward": baseline_row["reward"] - row["reward"],
+                "equity_index": baseline_row["equity_index"] - row["equity_index"],
+                "clinical_improvement": baseline_row["clinical_improvement"] - row["clinical_improvement"],
+                "overall_score": baseline_row.get("overall_score", baseline_row["reward"])
+                - row.get("overall_score", row["reward"]),
+            },
+        }
+
+    experiments = []
+    with ThreadPoolExecutor(max_workers=min(4, len(components))) as pool:
+        futures = [pool.submit(_run_ablation, name, attr) for name, attr in components]
+        for future in as_completed(futures):
+            experiments.append(future.result())
+
+    # Preserve component order
+    component_order = [name for name, _ in components]
+    experiments.sort(key=lambda e: component_order.index(e["component"]))
+
+    return {
+        "config": asdict(cfg),
+        "autotune": autotune,
+        "baseline": baseline_row,
+        "experiments": experiments,
+    }
+
+
+def run_scenario_lab(payload: Dict) -> Dict:
+    left = payload.get("scenario_left", "baseline")
+    right = payload.get("scenario_right", "low_income_skew")
+
+    # Only train the proposed algorithm for each scenario (much faster than full comparison)
+    cfg, autotune = prepare_config(payload)
+    cfg = _apply_ablation_and_runtime_overrides(cfg, payload)
+    # Use reduced budget for interactive speed
+    scenario_cfg = TrainingConfig(**asdict(cfg))
+    scenario_cfg.episodes = max(40, cfg.episodes // 2)
+    scenario_cfg.cohort_size = max(30, cfg.cohort_size // 2)
+
+    fairness_algo = next(item for item in ALGORITHMS if item["id"] == "fairness_constrained")
+
+    left_payload = {**payload, "scenario": left, "auto_tune": False}
+    right_payload = {**payload, "scenario": right, "auto_tune": False}
+
+    # Run both scenarios in parallel
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        left_future = pool.submit(_run_single_algorithm_with_payload, fairness_algo, scenario_cfg, left_payload)
+        right_future = pool.submit(_run_single_algorithm_with_payload, fairness_algo, scenario_cfg, right_payload)
+        left_row, left_series = left_future.result()
+        right_row, right_series = right_future.result()
+
+    left_row = _attach_uncertainty(left_row, fairness_algo, scenario_cfg, left_payload)
+    right_row = _attach_uncertainty(right_row, fairness_algo, scenario_cfg, right_payload)
+
+    delta = {}
+    for key in [
+        "reward", "equity_index", "clinical_improvement",
+        "avg_treatment_cost", "avg_rfb", "theil_index", "atkinson_index",
+        "cvar_reward", "sharpe_ratio", "intersectional_gap",
+    ]:
+        delta[key] = right_row.get(key, 0.0) - left_row.get(key, 0.0)
+
+    return {
+        "left": {"scenario": left, "results": [left_row], "series": [left_series]},
+        "right": {"scenario": right, "results": [right_row], "series": [right_series]},
+        "proposed_delta": delta,
+    }
+
+
+def explain_counterfactual(payload: Dict) -> Dict:
+    env = _build_environment(payload)
+    state = payload.get("state") if isinstance(payload.get("state"), dict) else {}
+    profile = payload.get("profile") if isinstance(payload.get("profile"), dict) else {}
+
+    severity = float(state.get("severity", 0.62))
+    cumulative_cost = float(state.get("cumulative_cost", 200.0))
+    last_adherence = float(state.get("last_adherence", 1.0))
+    economic_capacity = float(profile.get("economic_capacity", 1800.0))
+    insurance_support = float(profile.get("insurance_support", 0.28))
+    vulnerability = float(profile.get("vulnerability", 0.52))
+    comorbidity_count = int(profile.get("comorbidity_count", 0))
+    treatment_resistance = float(state.get("treatment_resistance", 0.0))
+    geographic_access = float(profile.get("geographic_access", 0.7))
+
+    action_insights = []
+    for action_id, action in enumerate(env.actions):
+        effective_cost = action["cost"] * (1.0 - insurance_support) * (1.0 + env.drift_cost_inflation)
+        # Geographic cost premium for rural areas
+        if geographic_access < 0.5:
+            effective_cost *= 1.12
+        projected_rfb = (cumulative_cost + effective_cost) / max(economic_capacity, 1.0)
+
+        adherence_prob = (
+            0.92
+            - 0.58 * projected_rfb
+            - 0.11 * severity
+            - 0.12 * vulnerability
+            + 0.08 * insurance_support
+            - 0.06 * comorbidity_count
+            - env.drift_adherence_drop
+        )
+        adherence_prob = float(min(0.98, max(0.04, adherence_prob)))
+
+        efficacy = action["efficacy"] * (1.0 - env.drift_efficacy_drop)
+        # Treatment resistance reduces efficacy
+        efficacy *= (1.0 - 0.3 * treatment_resistance)
+        # Comorbidity reduces expected benefit
+        comorbidity_factor = 1.0 - 0.08 * comorbidity_count
+        expected_clinical_delta = adherence_prob * efficacy * (1.0 - 0.25 * vulnerability) * comorbidity_factor
+
+        # Drug interaction risk
+        interaction_risk = action.get("interaction_sensitivity", 0.02) * comorbidity_count * 0.1
+
+        proxy_reward = (
+            8.0 * expected_clinical_delta
+            - 0.55 * max(0.0, severity - expected_clinical_delta)
+            - 2.2 * max(0.0, projected_rfb - 0.38)
+            - 0.5 * interaction_risk
+            - 0.4 * action["risk"]
+        )
+
+        action_insights.append(
+            {
+                "action_id": action_id,
+                "action": action["name"],
+                "cost": action["cost"],
+                "effective_cost": round(effective_cost, 2),
+                "projected_rfb": round(projected_rfb, 4),
+                "adherence_prob": round(adherence_prob, 4),
+                "expected_clinical_delta": round(expected_clinical_delta, 4),
+                "interaction_risk": round(interaction_risk, 4),
+                "proxy_reward": round(proxy_reward, 4),
+                "specialisation": action.get("specialisation", "general"),
+            }
+        )
+
+    sorted_actions = sorted(action_insights, key=lambda item: item["proxy_reward"], reverse=True)
+    best = sorted_actions[0]
+    second = sorted_actions[1] if len(sorted_actions) > 1 else sorted_actions[0]
+    worst = sorted_actions[-1]
+
+    baseline_choices = {
+        "clinical": max(action_insights, key=lambda item: item["expected_clinical_delta"])["action"],
+        "cost_sensitive": min(action_insights, key=lambda item: item["projected_rfb"])["action"],
+        "multi_objective": sorted_actions[0]["action"],
+        "primal_dual": sorted(action_insights, key=lambda item: (item["projected_rfb"], -item["expected_clinical_delta"]))[0]["action"],
+        "sarsa": sorted(action_insights, key=lambda item: item["proxy_reward"], reverse=True)[min(1, len(action_insights) - 1)]["action"],
+        "soft_q": sorted_actions[0]["action"],
+        "cvar_sensitive": sorted(action_insights, key=lambda item: (-item["interaction_risk"], item["proxy_reward"]), reverse=True)[0]["action"],
+        "actor_critic": sorted_actions[0]["action"],
+    }
+
+    return {
+        "recommended_action": best["action"],
+        "recommended_action_id": best["action_id"],
+        "why": (
+            f"Selected {best['action']} (projected RFB={best['projected_rfb']:.3f}, "
+            f"clinical Δ={best['expected_clinical_delta']:.3f}) because it maximizes "
+            f"the expected reward proxy while maintaining acceptable financial burden."
+        ),
+        "predicted_outcome_delta_vs_next_best": {
+            "reward": round(best["proxy_reward"] - second["proxy_reward"], 4),
+            "clinical": round(best["expected_clinical_delta"] - second["expected_clinical_delta"], 4),
+            "rfb": round(best["projected_rfb"] - second["projected_rfb"], 4),
+        },
+        "predicted_outcome_delta_vs_worst": {
+            "reward": round(best["proxy_reward"] - worst["proxy_reward"], 4),
+            "clinical": round(best["expected_clinical_delta"] - worst["expected_clinical_delta"], 4),
+            "rfb": round(best["projected_rfb"] - worst["projected_rfb"], 4),
+        },
+        "baseline_actions": baseline_choices,
+        "action_table": sorted_actions,
+        "patient_context": {
+            "severity": severity,
+            "economic_capacity": economic_capacity,
+            "insurance_support": insurance_support,
+            "vulnerability": vulnerability,
+            "comorbidity_count": comorbidity_count,
+            "treatment_resistance": treatment_resistance,
+            "geographic_access": geographic_access,
+        },
+    }
+
+
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+#  Sensitivity Analysis
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+def run_sensitivity_analysis(payload: Dict) -> Dict:
+    """
+    Parameter sweep with respect to a target parameter.
+    Returns metric trajectories over the swept parameter.
+    """
+    cfg = parse_config(payload)
+    cfg = _apply_ablation_and_runtime_overrides(cfg, payload)
+
+    param_name = str(payload.get("sweep_param", "fairness_lambda"))
+    sweep_min = float(payload.get("sweep_min", 0.0))
+    sweep_max = float(payload.get("sweep_max", 1.0))
+    sweep_steps = int(payload.get("sweep_steps", 8))
+    sweep_steps = max(3, min(20, sweep_steps))
+
+    fairness_algo = next(item for item in ALGORITHMS if item["id"] == "fairness_constrained")
+
+    sweep_values: List[float] = []
+
+    step_size = (sweep_max - sweep_min) / max(1, sweep_steps - 1)
+
+    def _run_sweep_point(val: float):
+        sweep_cfg = TrainingConfig(**asdict(cfg))
+        sweep_cfg.episodes = max(30, cfg.episodes // 3)
+        sweep_cfg.cohort_size = max(20, cfg.cohort_size // 3)
+        if hasattr(sweep_cfg, param_name):
+            setattr(sweep_cfg, param_name, val)
+        row, _ = _run_single_algorithm_with_payload(fairness_algo, sweep_cfg, payload)
+        return {
+            "param_value": val,
+            "reward": row.get("reward", 0.0),
+            "equity_index": row.get("equity_index", 0.0),
+            "clinical_improvement": row.get("clinical_improvement", 0.0),
+            "avg_rfb": row.get("avg_rfb", 0.0),
+            "gini_rfb": row.get("gini_rfb", 0.0),
+            "theil_index": row.get("theil_index", 0.0),
+            "overall_score": row.get("overall_score", 0.0),
+        }
+
+    for i in range(sweep_steps):
+        sweep_values.append(round(sweep_min + i * step_size, 4))
+
+    with ThreadPoolExecutor(max_workers=min(4, sweep_steps)) as pool:
+        futures = {pool.submit(_run_sweep_point, val): val for val in sweep_values}
+        sweep_results_map = {}
+        for future in as_completed(futures):
+            val = futures[future]
+            sweep_results_map[val] = future.result()
+
+    sweep_results = [sweep_results_map[val] for val in sweep_values]
+
+    return {
+        "param_name": param_name,
+        "sweep_values": sweep_values,
+        "results": sweep_results,
+        "config": asdict(cfg),
+    }
+
+
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+#  Convergence Diagnostics
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+def run_convergence_diagnostics(payload: Dict) -> Dict:
+    """
+    Train the proposed algorithm and return convergence diagnostics:
+    autocorrelation, EWMA, linear slope, effective sample size.
+    """
+    from rl.metrics import (
+        autocorrelation, ewma, linear_slope, convergence_rate, effective_sample_size,
+    )
+
+    cfg = parse_config(payload)
+    cfg = _apply_ablation_and_runtime_overrides(cfg, payload)
+    fairness_algo = next(item for item in ALGORITHMS if item["id"] == "fairness_constrained")
+    _, series = _run_single_algorithm_with_payload(fairness_algo, cfg, payload)
+
+    rewards = series["episode_rewards"]
+    gini_series = series["episode_gini"]
+
+    reward_autocorr = [autocorrelation(rewards, lag) for lag in range(1, min(20, len(rewards) // 2))]
+    gini_autocorr = [autocorrelation(gini_series, lag) for lag in range(1, min(20, len(gini_series) // 2))]
+
+    reward_ewma = ewma(rewards, span=10)
+    gini_ewma = ewma(gini_series, span=10)
+
+    reward_slope = linear_slope(rewards)
+    gini_slope = linear_slope(gini_series)
+
+    reward_conv_rate = convergence_rate(rewards, window=20)
+    gini_conv_rate = convergence_rate(gini_series, window=20)
+
+    reward_ess = effective_sample_size(rewards)
+    gini_ess = effective_sample_size(gini_series)
+
+    return {
+        "reward": {
+            "series": rewards,
+            "ewma": reward_ewma,
+            "autocorrelation": reward_autocorr,
+            "linear_slope": reward_slope,
+            "convergence_rate": reward_conv_rate,
+            "effective_sample_size": reward_ess,
+        },
+        "gini": {
+            "series": gini_series,
+            "ewma": gini_ewma,
+            "autocorrelation": gini_autocorr,
+            "linear_slope": gini_slope,
+            "convergence_rate": gini_conv_rate,
+            "effective_sample_size": gini_ess,
+        },
+        "config": asdict(cfg),
+    }

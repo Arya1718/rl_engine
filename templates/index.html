@@ -1,0 +1,592 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Ethical RL Healthcare Simulator</title>
+    <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>⚕</text></svg>" />
+    <meta name="theme-color" content="#030a06" />
+    <link rel="preconnect" href="https://fonts.googleapis.com" />
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+    <link href="https://fonts.googleapis.com/css2?family=Share+Tech+Mono&family=JetBrains+Mono:wght@400;600;700&display=swap" rel="stylesheet" />
+    <link rel="stylesheet" href="{{ url_for('static', filename='styles.css') }}" />
+    <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/jspdf@2.5.1/dist/jspdf.umd.min.js"></script>
+  </head>
+  <body>
+    <div class="scanlines"></div>
+    <main class="layout layout-shell">
+      <aside class="sidebar">
+        <section class="controls card">
+          <h2>Tuning Controls</h2>
+          <div class="grid-controls">
+            <label>Episodes <input id="episodes" type="number" min="20" max="500" value="180" /></label>
+            <label>Horizon <input id="horizon" type="number" min="4" max="32" value="16" /></label>
+            <label>Cohort Size <input id="cohort_size" type="number" min="20" max="250" value="80" /></label>
+            <label>Fairness λ <input id="fairness_lambda" type="number" step="0.05" min="0" max="2" value="0.8" /></label>
+            <label>Cost Weight <input id="cost_weight" type="number" step="0.05" min="0" max="2" value="0.55" /></label>
+            <label>Risk Weight <input id="risk_weight" type="number" step="0.05" min="0" max="2" value="0.45" /></label>
+            <label>Seed <input id="seed" type="number" min="1" max="99999" value="42" /></label>
+          </div>
+
+          <h3>Algorithms</h3>
+          <div class="algo-grid" id="algo-grid">
+            {% for algorithm in algorithms %}
+            <label class="algo-item">
+              <input type="checkbox" value="{{ algorithm.id }}" checked />
+              <span>
+                <strong>{{ algorithm.name }}</strong>
+                <em>{{ algorithm.paper_link }}</em>
+              </span>
+            </label>
+            {% endfor %}
+          </div>
+          <button id="run-btn">Start</button>
+
+          <h3>Drift & Robustness</h3>
+          <div class="grid-controls">
+            <label>Cost Inflation
+              <input id="drift-cost-inflation" type="number" step="0.05" min="0" max="1" value="0" />
+            </label>
+            <label>Adherence Drop
+              <input id="drift-adherence-drop" type="number" step="0.02" min="0" max="0.6" value="0" />
+            </label>
+            <label>Efficacy Drop
+              <input id="drift-efficacy-drop" type="number" step="0.02" min="0" max="0.6" value="0" />
+            </label>
+            <label>Uncertainty Seeds
+              <input id="uncertainty-seeds" type="number" min="2" max="6" value="3" />
+            </label>
+          </div>
+
+          <h3>Parameters</h3>
+          <div class="grid-controls">
+            <label>Soft-Q Temp
+              <input id="soft-q-temp" type="number" step="0.01" min="0.01" max="1" value="0.15" />
+            </label>
+            <label>CVaR α
+              <input id="cvar-alpha" type="number" step="0.05" min="0.05" max="0.5" value="0.15" />
+            </label>
+            <label>N-Step
+              <input id="n-step" type="number" min="1" max="8" value="3" />
+            </label>
+            <label>TD(λ)
+              <input id="eligibility-lambda" type="number" step="0.05" min="0" max="1" value="0.7" />
+            </label>
+          </div>
+
+          <h3>Leaderboard Weights</h3>
+          <div class="grid-controls">
+            <label>Reward W
+              <input id="weight-reward" type="number" step="0.1" min="0" max="5" value="1.0" />
+            </label>
+            <label>Clinical W
+              <input id="weight-clinical" type="number" step="0.1" min="0" max="5" value="1.2" />
+            </label>
+            <label>Fairness W
+              <input id="weight-fairness" type="number" step="0.1" min="0" max="5" value="1.5" />
+            </label>
+            <label>Cost W
+              <input id="weight-cost" type="number" step="0.1" min="0" max="5" value="0.8" />
+            </label>
+          </div>
+
+          <h3>Narration + Report</h3>
+          <div class="algo-grid">
+            <label class="algo-item"><input id="narration-mode" type="checkbox" checked /><span><strong>Live Narration Mode</strong><em>Auto insight narration while streaming</em></span></label>
+          </div>
+          <button id="report-btn" type="button">Export 1-Click PDF</button>
+        </section>
+      </aside>
+
+      <section class="main-content">
+        <section class="hero card">
+          <div>
+            <p class="eyebrow">RL_TERMINAL</p>
+            <h1>Ethical RL // Socioeconomic Fairness Engine</h1>
+            <p class="subtitle">
+              Training monitor with 11 algorithms, 8D state space, SumTree PER, N-step returns,
+              eligibility traces, CVaR-constrained risk optimisation, Thompson Sampling,
+              REINFORCE policy gradient, and multi-inequality fairness.
+            </p>
+          </div>
+          <div class="hero-controls">
+            <div class="hero-badge">[PROPOSED] fairness_constrained</div>
+            <button id="theme-toggle" type="button" title="Toggle light/dark theme">&#9680;</button>
+          </div>
+        </section>
+
+        <section class="section-nav card" id="section-nav">
+          <button class="section-nav-btn active" type="button" data-section="live">Live Training</button>
+          <button class="section-nav-btn" type="button" data-section="scenario">Scenario Lab</button>
+          <button class="section-nav-btn" type="button" data-section="ablation">Ablation</button>
+          <button class="section-nav-btn" type="button" data-section="patient">Patient Advisor</button>
+          <button class="section-nav-btn" type="button" data-section="analytics">Analytics</button>
+          <button class="section-nav-btn" type="button" data-section="sensitivity">Sensitivity</button>
+          <button class="section-nav-btn" type="button" data-section="inspector">Policy Inspector</button>
+          <button class="section-nav-btn" type="button" data-section="pareto">Pareto</button>
+        </section>
+
+        <section class="section-panel active" data-section="live">
+          <section class="kpis metrics-extended">
+            <article class="card kpi"><h4>Top Algorithm</h4><p id="kpi-top">-</p></article>
+            <article class="card kpi"><h4>Best Clinical Gain</h4><p id="kpi-clinical">-</p></article>
+            <article class="card kpi"><h4>Best Equity Index</h4><p id="kpi-equity">-</p></article>
+            <article class="card kpi"><h4>Lowest Burden Gini</h4><p id="kpi-gini">-</p></article>
+            <article class="card kpi"><h4>Proposed Rank</h4><p id="kpi-proposed-rank">-</p></article>
+            <article class="card kpi"><h4>Proposed Reward</h4><p id="kpi-proposed-reward">-</p></article>
+            <article class="card kpi"><h4>Reward Gap</h4><p id="kpi-reward-gap">-</p></article>
+            <article class="card kpi"><h4>Runtime</h4><p id="kpi-runtime">-</p></article>
+            <article class="card kpi"><h4>Live Throughput</h4><p id="kpi-throughput">-</p></article>
+            <article class="card kpi"><h4>Active Algorithms</h4><p id="kpi-active">-</p></article>
+            <article class="card kpi"><h4>Live Mean Reward</h4><p id="kpi-live-reward">-</p></article>
+            <article class="card kpi"><h4>Live Mean Gini</h4><p id="kpi-live-gini">-</p></article>
+            <article class="card kpi"><h4>Live Leader</h4><p id="kpi-live-leader">-</p></article>
+            <article class="card kpi"><h4>ETA</h4><p id="kpi-eta">-</p></article>
+            <article class="card kpi"><h4>Novelty Index</h4><p id="kpi-novelty-index">-</p></article>
+            <article class="card kpi"><h4>Pareto Wins</h4><p id="kpi-pareto-wins">-</p></article>
+            <article class="card kpi"><h4>Composite Lead</h4><p id="kpi-composite-lead">-</p></article>
+            <article class="card kpi"><h4>Fair-Cost Efficiency</h4><p id="kpi-fair-cost-eff">-</p></article>
+            <article class="card kpi"><h4>Convergence Velocity</h4><p id="kpi-convergence-velocity">-</p></article>
+            <article class="card kpi"><h4>Theil Index</h4><p id="kpi-theil">-</p></article>
+            <article class="card kpi"><h4>CVaR Reward</h4><p id="kpi-cvar">-</p></article>
+            <article class="card kpi"><h4>Sharpe Ratio</h4><p id="kpi-sharpe">-</p></article>
+            <article class="card kpi"><h4>Intersectional Gap</h4><p id="kpi-intersectional-gap">-</p></article>
+          </section>
+
+          <section class="status-grid status-grid-wide">
+            <article class="card status-card">
+              <h3>Realtime Status</h3>
+              <p id="stream-state">Idle</p>
+              <div class="progress-bar"><span id="progress-fill"></span></div>
+              <p id="stream-meta">No active run</p>
+            </article>
+            <article class="card terminal-card terminal-card-large">
+              <div class="terminal-head">
+                <h3>Log Console</h3>
+                <span class="log-badge" id="log-rate">idle</span>
+              </div>
+              <pre id="terminal-log">$ waiting_for_run...</pre>
+            </article>
+          </section>
+        </section>
+
+        <section class="section-panel" data-section="scenario">
+          <section class="status-grid status-grid-single">
+            <article class="card status-card">
+              <h3>Scenario Lab</h3>
+              <div class="grid-controls">
+                <label>Scenario A
+                  <select id="scenario-left">
+                    <option value="baseline" selected>Baseline</option>
+                    <option value="low_income_skew">Low Income Skew</option>
+                    <option value="high_chronic_load">High Chronic Load</option>
+                    <option value="policy_shock">Policy Shock</option>
+                    <option value="pandemic_surge">Pandemic Surge</option>
+                    <option value="rural_disparity">Rural Disparity</option>
+                  </select>
+                </label>
+                <label>Scenario B
+                  <select id="scenario-right">
+                    <option value="low_income_skew" selected>Low Income Skew</option>
+                    <option value="baseline">Baseline</option>
+                    <option value="high_chronic_load">High Chronic Load</option>
+                    <option value="policy_shock">Policy Shock</option>
+                    <option value="pandemic_surge">Pandemic Surge</option>
+                    <option value="rural_disparity">Rural Disparity</option>
+                  </select>
+                </label>
+              </div>
+              <button id="scenario-run-btn" type="button">Run Scenario Lab</button>
+              <div class="run-status" id="scenario-run-status">
+                <span class="spinner" id="scenario-spinner" aria-hidden="true"></span>
+                <span id="scenario-elapsed">Elapsed: 0.0s</span>
+              </div>
+              <p id="scenario-summary">Scenario comparison not run yet.</p>
+            </article>
+          </section>
+        </section>
+
+        <section class="section-panel" data-section="ablation">
+          <section class="status-grid status-grid-single">
+            <article class="card status-card">
+              <h3>Ablation Studio (9 Components)</h3>
+              <div class="algo-grid">
+                <label class="algo-item"><input id="ablation-fairness-term" type="checkbox" checked /><span><strong>Fairness Term</strong><em>Enable fairness penalty shaping</em></span></label>
+                <label class="algo-item"><input id="ablation-shielding" type="checkbox" checked /><span><strong>Action Shielding</strong><em>Affordability-aware action guard</em></span></label>
+                <label class="algo-item"><input id="ablation-replay" type="checkbox" checked /><span><strong>SumTree PER</strong><em>Proportional prioritised replay</em></span></label>
+                <label class="algo-item"><input id="ablation-double-q" type="checkbox" checked /><span><strong>Double Q</strong><em>Polyak-averaged target estimation</em></span></label>
+                <label class="algo-item"><input id="ablation-episode-shaping" type="checkbox" checked /><span><strong>Episode Shaping</strong><em>Fairness episode bonus/penalty</em></span></label>
+                <label class="algo-item"><input id="ablation-eligibility-traces" type="checkbox" checked /><span><strong>Eligibility Traces</strong><em>TD(λ) trace-based credit assignment</em></span></label>
+                <label class="algo-item"><input id="ablation-curriculum" type="checkbox" checked /><span><strong>Curriculum Learning</strong><em>Gradual cohort complexity ramp</em></span></label>
+                <label class="algo-item"><input id="ablation-hindsight" type="checkbox" checked /><span><strong>Hindsight Relabelling</strong><em>Fairness-aware experience relabelling</em></span></label>
+                <label class="algo-item"><input id="ablation-multi-inequality" type="checkbox" checked /><span><strong>Multi-Inequality</strong><em>Theil + Atkinson alongside Gini</em></span></label>
+              </div>
+              <button id="ablation-run-btn" type="button">Run Ablation</button>
+              <div class="run-status" id="ablation-run-status">
+                <span class="spinner" id="ablation-spinner" aria-hidden="true"></span>
+                <span id="ablation-elapsed">Elapsed: 0.0s</span>
+              </div>
+              <p id="ablation-summary">Ablation analysis not run yet.</p>
+            </article>
+          </section>
+        </section>
+
+        <section class="section-panel" data-section="patient">
+          <section class="card results">
+            <h3>Realtime Patient Advisor</h3>
+            <div class="grid-controls">
+              <label>Severity <input id="patient-severity" type="number" step="0.01" min="0" max="1" value="0.55" /></label>
+              <label>Monthly Budget <input id="patient-capacity" type="number" step="50" min="500" max="6000" value="1800" /></label>
+              <label>Recent Adherence <input id="patient-adherence" type="number" step="0.1" min="0" max="1" value="0.8" /></label>
+            </div>
+            <button id="patient-suggest-btn" type="button">Get Realtime Suggestion</button>
+            <p id="patient-summary">No patient recommendation yet.</p>
+          </section>
+
+          <section class="card results">
+            <h3>Counterfactual Explainer (5 Treatment Arms)</h3>
+            <div class="grid-controls">
+              <label>Severity <input id="cf-severity" type="number" step="0.01" min="0" max="1" value="0.62" /></label>
+              <label>Cumulative Cost <input id="cf-cum-cost" type="number" step="10" min="0" max="5000" value="200" /></label>
+              <label>Adherence Last <input id="cf-last-adh" type="number" step="0.1" min="0" max="1" value="1" /></label>
+              <label>Economic Capacity <input id="cf-capacity" type="number" step="50" min="500" max="8000" value="1800" /></label>
+              <label>Insurance Support <input id="cf-insurance" type="number" step="0.01" min="0" max="1" value="0.28" /></label>
+              <label>Vulnerability <input id="cf-vulnerability" type="number" step="0.01" min="0" max="1" value="0.52" /></label>
+              <label>Comorbidities <input id="cf-comorbidities" type="number" step="1" min="0" max="4" value="0" /></label>
+              <label>Resistance <input id="cf-resistance" type="number" step="0.1" min="0" max="1" value="0" /></label>
+              <label>Geographic Access <input id="cf-geo-access" type="number" step="0.05" min="0" max="1" value="0.7" /></label>
+            </div>
+            <button id="counterfactual-btn" type="button">Explain Counterfactual</button>
+            <p id="counterfactual-summary">No explanation yet.</p>
+            <div class="table-wrap">
+              <table id="counterfactual-table">
+                <thead>
+                  <tr>
+                    <th>Action</th>
+                    <th>Proxy Reward</th>
+                    <th>Clinical Δ</th>
+                    <th>Projected RFB</th>
+                    <th>Adherence Prob</th>
+                    <th>Interaction Risk</th>
+                  </tr>
+                </thead>
+                <tbody></tbody>
+              </table>
+            </div>
+          </section>
+        </section>
+
+        <section class="section-panel" data-section="analytics">
+          <section class="status-grid status-grid-wide">
+            <article class="card status-card">
+              <h3>Policy Playback Timeline</h3>
+              <label class="compact-input">Algorithm
+                <select id="playback-algo">
+                  <option value="fairness_constrained" selected>Proposed</option>
+                  <option value="clinical">Clinical</option>
+                  <option value="cost_sensitive">Cost-Sensitive</option>
+                  <option value="multi_objective">Multi-Objective</option>
+                  <option value="primal_dual">Primal-Dual</option>
+                  <option value="sarsa">SARSA</option>
+                  <option value="soft_q">Soft Q</option>
+                  <option value="cvar_sensitive">CVaR</option>
+                  <option value="actor_critic">Actor-Critic</option>
+                  <option value="thompson_sampling">Thompson Sampling</option>
+                  <option value="reinforce_pg">REINFORCE PG</option>
+                </select>
+              </label>
+              <input id="playback-slider" type="range" min="1" max="1" value="1" />
+              <p id="playback-meta">Episode snapshot unavailable</p>
+            </article>
+            <article class="card terminal-card">
+              <div class="terminal-head">
+                <h3>Narration Stream</h3>
+                <span class="log-badge" id="narration-rate">idle</span>
+              </div>
+              <pre id="narration-log">$ narration_ready...</pre>
+            </article>
+          </section>
+
+          <section class="analytics-pane">
+            <section class="card chart-tools">
+              <div class="chart-tools-row">
+                <h3>Live Charts</h3>
+                <label class="compact-input">Trend Mode
+                  <select id="trend-mode">
+                    <option value="focus" selected>Proposed + Leader</option>
+                    <option value="all">All Algorithms</option>
+                  </select>
+                </label>
+                <p class="hint">Click any chart to enlarge in a clear modal view.</p>
+              </div>
+            </section>
+
+            <section class="charts">
+              <article class="card chart-card">
+                <h3>Learning Curve (Reward)</h3>
+                <canvas id="reward-chart"></canvas>
+              </article>
+              <article class="card chart-card">
+                <h3>Fairness Trend (Gini)</h3>
+                <canvas id="gini-chart"></canvas>
+              </article>
+              <article class="card chart-card">
+                <h3>Adherence Trend</h3>
+                <canvas id="adherence-chart"></canvas>
+              </article>
+              <article class="card chart-card">
+                <h3>Clinical Improvement Trend</h3>
+                <canvas id="clinical-chart"></canvas>
+              </article>
+              <article class="card chart-card">
+                <h3>Theil Index Trend</h3>
+                <canvas id="theil-chart"></canvas>
+              </article>
+              <article class="card chart-card">
+                <h3>CVaR Reward Trend</h3>
+                <canvas id="cvar-chart"></canvas>
+              </article>
+              <article class="card chart-card">
+                <h3>Policy Entropy Trend</h3>
+                <canvas id="entropy-chart"></canvas>
+              </article>
+              <article class="card chart-card">
+                <h3>Final Reward Comparison</h3>
+                <canvas id="reward-bar-chart"></canvas>
+              </article>
+              <article class="card chart-card">
+                <h3>Cost vs Equity Scatter</h3>
+                <canvas id="scatter-chart"></canvas>
+              </article>
+              <article class="card chart-card">
+                <h3>Performance Radar</h3>
+                <canvas id="radar-chart"></canvas>
+              </article>
+              <article class="card chart-card">
+                <h3>RFB & Gini Bars</h3>
+                <canvas id="rfb-bar-chart"></canvas>
+              </article>
+              <article class="card chart-card">
+                <h3>Pareto Frontier (Cost vs Clinical)</h3>
+                <canvas id="pareto-frontier-chart"></canvas>
+              </article>
+              <article class="card chart-card">
+                <h3>Proposed Dominance Margin</h3>
+                <canvas id="dominance-chart"></canvas>
+              </article>
+              <article class="card chart-card">
+                <h3>Novelty Gain Decomposition</h3>
+                <canvas id="novelty-gain-chart"></canvas>
+              </article>
+              <article class="card chart-card">
+                <h3>Uncertainty Bands (Reward CI95)</h3>
+                <canvas id="uncertainty-band-chart"></canvas>
+              </article>
+              <article class="card chart-card">
+                <h3>Ablation Impact (With vs Without)</h3>
+                <canvas id="ablation-impact-chart"></canvas>
+              </article>
+              <article class="card chart-card">
+                <h3>Scenario Lab Comparison</h3>
+                <canvas id="scenario-compare-chart"></canvas>
+              </article>
+              <article class="card chart-card">
+                <h3>Playback Fairness/Reward Trace</h3>
+                <canvas id="playback-trace-chart"></canvas>
+              </article>
+              <article class="card chart-card">
+                <h3>Lorenz Curve (Burden Distribution)</h3>
+                <canvas id="lorenz-chart"></canvas>
+              </article>
+              <article class="card chart-card">
+                <h3>Intersectional Disparity Heatmap</h3>
+                <canvas id="heatmap-chart"></canvas>
+              </article>
+            </section>
+
+            <section class="card results">
+              <h3>Fairness Audit Panel</h3>
+              <p id="fairness-alert">No audit data yet.</p>
+              <div class="table-wrap">
+                <table id="fairness-audit-table">
+                  <thead>
+                    <tr>
+                      <th>Subgroup</th>
+                      <th>Mean RFB</th>
+                    </tr>
+                  </thead>
+                  <tbody></tbody>
+                </table>
+              </div>
+            </section>
+
+            <section class="card results">
+              <h3>Algorithm Comparison (Extended)</h3>
+              <div class="table-wrap">
+                <table id="results-table">
+                  <thead>
+                    <tr>
+                      <th>Algorithm</th>
+                      <th>Reward</th>
+                      <th>Clinical Δ</th>
+                      <th>Adherence</th>
+                      <th>Avg Cost</th>
+                      <th>Avg RFB</th>
+                      <th>Gini</th>
+                      <th>Equity</th>
+                      <th>Theil</th>
+                      <th>Atkinson</th>
+                      <th>Sharpe</th>
+                      <th>CVaR</th>
+                    </tr>
+                  </thead>
+                  <tbody></tbody>
+                </table>
+              </div>
+            </section>
+          </section>
+        </section>
+
+        <section class="section-panel" data-section="sensitivity">
+          <section class="status-grid status-grid-single">
+            <article class="card status-card">
+              <h3>Sensitivity Analysis</h3>
+              <div class="grid-controls">
+                <label>Sweep Parameter
+                  <select id="sweep-param">
+                    <option value="fairness_lambda" selected>Fairness λ</option>
+                    <option value="cost_weight">Cost Weight</option>
+                    <option value="risk_weight">Risk Weight</option>
+                    <option value="soft_q_temperature">Soft-Q Temperature</option>
+                    <option value="cvar_alpha">CVaR α</option>
+                    <option value="eligibility_lambda">TD(λ)</option>
+                    <option value="learning_rate">Learning Rate</option>
+                  </select>
+                </label>
+                <label>Min <input id="sweep-min" type="number" step="0.05" min="0" max="5" value="0" /></label>
+                <label>Max <input id="sweep-max" type="number" step="0.05" min="0" max="5" value="1.0" /></label>
+                <label>Steps <input id="sweep-steps" type="number" min="3" max="20" value="8" /></label>
+              </div>
+              <button id="sensitivity-run-btn" type="button">Run Sensitivity Sweep</button>
+              <div class="run-status" id="sensitivity-run-status">
+                <span class="spinner" id="sensitivity-spinner" aria-hidden="true"></span>
+                <span id="sensitivity-elapsed">Elapsed: 0.0s</span>
+              </div>
+              <p id="sensitivity-summary">Sensitivity analysis not run yet.</p>
+              <div class="chart-card" style="margin-top:1rem;">
+                <canvas id="sensitivity-chart"></canvas>
+              </div>
+            </article>
+          </section>
+          <section class="status-grid status-grid-single">
+            <article class="card status-card">
+              <h3>Convergence Diagnostics</h3>
+              <button id="convergence-run-btn" type="button">Run Convergence Analysis</button>
+              <div class="run-status" id="convergence-run-status">
+                <span class="spinner" id="convergence-spinner" aria-hidden="true"></span>
+                <span id="convergence-elapsed">Elapsed: 0.0s</span>
+              </div>
+              <p id="convergence-summary">Convergence diagnostics not run yet.</p>
+              <div class="charts" style="margin-top:1rem;">
+                <div class="chart-card"><canvas id="convergence-reward-chart"></canvas></div>
+                <div class="chart-card"><canvas id="convergence-autocorr-chart"></canvas></div>
+              </div>
+            </article>
+          </section>
+        </section>
+
+        <section class="section-panel" data-section="inspector">
+          <section class="status-grid status-grid-single">
+            <article class="card status-card">
+              <h3>Policy Inspector</h3>
+              <p class="hint">Train an algorithm and inspect its learned Q-values, action distribution, and reward decomposition.</p>
+              <div class="grid-controls">
+                <label>Algorithm
+                  <select id="inspect-algo">
+                    {% for algorithm in algorithms %}
+                    <option value="{{ algorithm.id }}">{{ algorithm.name }}</option>
+                    {% endfor %}
+                  </select>
+                </label>
+              </div>
+              <button id="inspect-run-btn" type="button">Inspect Policy</button>
+              <div class="run-status" id="inspect-run-status">
+                <span class="spinner" id="inspect-spinner" aria-hidden="true"></span>
+                <span id="inspect-elapsed">Elapsed: 0.0s</span>
+              </div>
+              <p id="inspect-summary">No inspection data yet.</p>
+            </article>
+          </section>
+          <section class="charts">
+            <article class="card chart-card">
+              <h3>Action Distribution</h3>
+              <canvas id="inspect-action-chart"></canvas>
+            </article>
+            <article class="card chart-card">
+              <h3>Reward Decomposition</h3>
+              <canvas id="inspect-reward-decomp-chart"></canvas>
+            </article>
+          </section>
+          <section class="card results">
+            <h3>Top Q-Value States</h3>
+            <div class="table-wrap">
+              <table id="q-table">
+                <thead>
+                  <tr>
+                    <th>State</th>
+                    <th>Conservative</th>
+                    <th>Moderate</th>
+                    <th>Standard</th>
+                    <th>Intensive</th>
+                    <th>Aggressive</th>
+                    <th>Best Action</th>
+                  </tr>
+                </thead>
+                <tbody></tbody>
+              </table>
+            </div>
+          </section>
+        </section>
+
+        <section class="section-panel" data-section="pareto">
+          <section class="status-grid status-grid-single">
+            <article class="card status-card">
+              <h3>Pareto Frontier Analysis</h3>
+              <p class="hint">Compare all algorithms on multi-objective trade-offs and extract the Pareto frontier.</p>
+              <button id="pareto-run-btn" type="button">Extract Pareto Frontier</button>
+              <div class="run-status" id="pareto-run-status">
+                <span class="spinner" id="pareto-spinner" aria-hidden="true"></span>
+                <span id="pareto-elapsed">Elapsed: 0.0s</span>
+              </div>
+              <p id="pareto-summary">No Pareto analysis yet.</p>
+            </article>
+          </section>
+          <section class="charts">
+            <article class="card chart-card">
+              <h3>Equity vs Reward Frontier</h3>
+              <canvas id="pareto-equity-reward-chart"></canvas>
+            </article>
+            <article class="card chart-card">
+              <h3>Clinical vs Cost Frontier</h3>
+              <canvas id="pareto-clinical-cost-chart"></canvas>
+            </article>
+          </section>
+        </section>
+      </section>
+    </main>
+
+    <div class="chart-modal" id="chart-modal" aria-hidden="true">
+      <div class="chart-modal-backdrop" id="chart-modal-close"></div>
+      <div class="chart-modal-panel card">
+        <div class="chart-modal-head">
+          <h3 id="chart-modal-title">Chart Detail</h3>
+          <button id="chart-modal-close-btn" type="button">Close</button>
+        </div>
+        <canvas id="chart-modal-canvas"></canvas>
+      </div>
+    </div>
+
+    <script src="{{ url_for('static', filename='app.js') }}"></script>
+  </body>
+  </html>
